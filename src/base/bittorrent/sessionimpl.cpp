@@ -3840,7 +3840,8 @@ void SessionImpl::configureListeningInterface()
 }
 
 // Detect configured listening addresses that have disappeared from the system
-// (typically expired temporary/leased IPv6 addresses) and re-apply the listening
+// (typically expired temporary/leased IPv6 addresses) or that have lost their
+// route (standby/resume, network switch), and re-apply the listening
 // configuration, so the session won't stay bound to a stale, unreachable address.
 void SessionImpl::checkListenInterfaceAddresses()
 {
@@ -3851,6 +3852,7 @@ void SessionImpl::checkListenInterfaceAddresses()
     const QStringList configuredIPs = getListeningIPs();
     bool hasPinnedAddress = false;
     bool allPresent = true;
+    bool routeLost = false;
     for (const QString &ip : configuredIPs)
     {
         const QHostAddress addr {ip};
@@ -3863,12 +3865,35 @@ void SessionImpl::checkListenInterfaceAddresses()
 
         hasPinnedAddress = true;
         if (!QNetworkInterface::allAddresses().contains(addr))
+        {
             allPresent = false;
+            continue;
+        }
+
+        // The address still exists, but its route may be gone after standby
+        // resume or a network switch ("address present" is not "usable").
+        // GetBestRoute returns failure when no route covers the address.
+        SOCKADDR_INET target {};
+        target.si_family = addr.protocol() == QAbstractSocket::IPv6Protocol ? AF_INET6 : AF_INET;
+        if (addr.protocol() == QAbstractSocket::IPv6Protocol)
+            memcpy(target.Ipv6.sin6_addr.u.Byte, addr.toIPv6Address().c, 16);
+        else
+            target.Ipv4.sin_addr.S_un.S_addr = htonl(addr.toIPv4Address());
+        SOCKADDR_INET bestNextHop {};
+        MIB_IPFORWARD_ROW2 bestRow {};
+        if (::GetBestRoute2(nullptr, 0, nullptr, &target, 0,
+                &bestRow, &bestNextHop) != NO_ERROR)
+        {
+            routeLost = true;
+        }
     }
 
-    if (hasPinnedAddress && !allPresent)
+    if (hasPinnedAddress && (!allPresent || routeLost))
     {
-        LogMsg(tr("Configured listening address is no longer present. Re-applying the listening interface configuration..."), Log::WARNING);
+        if (!allPresent)
+            LogMsg(tr("Configured listening address is no longer present. Re-applying the listening interface configuration..."), Log::WARNING);
+        else
+            LogMsg(tr("Configured listening address has lost its route. Re-applying the listening interface configuration..."), Log::WARNING);
         configureListeningInterface();
     }
 }
