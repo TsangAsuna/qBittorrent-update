@@ -108,7 +108,11 @@ void ProgramUpdater::fallbackDownloadFinished(const Net::DownloadResult &result,
 
     if (result.status != Net::DownloadStatus::Success)
     {
-        LogMsg(tr("Failed to download the program update info. URL: \"%1\". Error: \"%2\"").arg(result.url, result.errorString) , Log::WARNING);
+        // Background update checks routinely fail on networks that cannot
+        // reach qbittorrent.org/fosshub (timeout / 404); only log at debug
+        // level so the execution log isn't spammed. User-invoked checks still
+        // surface failures through the UI.
+        qDebug() << "Failed to download the program update info. URL:" << result.url << "Error:" << result.errorString;
         handleFinishedRequest();
         return;
     }

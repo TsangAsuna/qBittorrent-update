@@ -284,6 +284,9 @@ namespace BitTorrent
         virtual void forceReannounce(int index = -1) = 0;
         virtual void forceDHTAnnounce() = 0;
         virtual void forceRecheck() = 0;
+        // Promise to libtorrent that all files are present: skip verification
+        // and seed immediately, serving only the pieces we actually have.
+        virtual void forceSeedMode() = 0;
         virtual void setUploadLimit(int limit) = 0;
         virtual void setDownloadLimit(int limit) = 0;
         virtual void setSuperSeeding(bool enable) = 0;

@@ -34,7 +34,9 @@
 #include <cstdint>
 #include <ctime>
 #include <ranges>
+#include <span>
 #include <string>
+#include <vector>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -43,6 +45,7 @@
 #endif
 
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/system/errc.hpp>
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/address.hpp>
@@ -54,6 +57,7 @@
 #include <libtorrent/ip_filter.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/session.hpp>
+#include <libtorrent/session_params.hpp>
 #include <libtorrent/session_stats.hpp>
 #include <libtorrent/session_status.hpp>
 #include <libtorrent/torrent_info.hpp>
@@ -67,6 +71,7 @@
 #include <QDeadlineTimer>
 #include <QDebug>
 #include <QDir>
+#include <QFile>
 #include <QFuture>
 #include <QHostAddress>
 #include <QJsonArray>
@@ -790,6 +795,10 @@ SessionImpl::~SessionImpl()
     // of all the components that could potentially use it
     m_asyncWorker->clear();
     m_asyncWorker->waitForDone();
+
+#ifdef QBT_USES_LIBTORRENT2
+    saveDHTState();
+#endif
 
     auto *nativeSessionProxy = new lt::session_proxy(m_nativeSession->abort());
     delete m_nativeSession;
@@ -1794,6 +1803,12 @@ void SessionImpl::endStartup(ResumeSessionContext *context)
         m_wakeupCheckTimestamp.start();
         wakeupCheckTimer->start(30s);
 
+        // Re-evaluate the listening interface periodically: bound addresses
+        // (esp. temporary/leased IPv6) may disappear while the session runs.
+        auto listenInterfaceCheckTimer = new QTimer(this);
+        connect(listenInterfaceCheckTimer, &QTimer::timeout, this, &SessionImpl::checkListenInterfaceAddresses);
+        listenInterfaceCheckTimer->start(30s);
+
         m_isRestored = true;
         emit startupProgressUpdated(100);
         emit restored();
@@ -1832,6 +1847,10 @@ void SessionImpl::initializeNativeSession()
 
     lt::session_params sessionParams {std::move(pack), {}};
 #ifdef QBT_USES_LIBTORRENT2
+    // Restore the DHT routing table saved at last shutdown, so the DHT joins
+    // the swarm with hundreds of live nodes right away instead of crawling
+    // up from the bootstrap nodes alone.
+    loadDHTState(sessionParams);
     switch (diskIOType())
     {
     case DiskIOType::Posix:
@@ -1847,7 +1866,16 @@ void SessionImpl::initializeNativeSession()
         break;
 #endif
     default:
+#if defined(QBT_USES_LIBTORRENT2) && (LIBTORRENT_VERSION_NUM >= 20100)
+        // Default on libtorrent 2.0: use pread/pwrite disk IO instead of the
+        // mmap default. The mmap implementation leaks committed memory during
+        // long seeding sessions (upstream issues #19914 / #23565, confirmed
+        // by a core developer); pread/pwrite is the officially recommended
+        // workaround with negligible throughput difference on Windows.
+        sessionParams.disk_io_constructor = customPreadDiskIOConstructor;
+#else
         sessionParams.disk_io_constructor = customDiskIOConstructor;
+#endif
         break;
     }
 #endif
@@ -2178,7 +2206,11 @@ lt::settings_pack SessionImpl::loadLTSettings() const
     settingsPack.set_int(lt::settings_pack::active_tracker_limit, -1);
     settingsPack.set_int(lt::settings_pack::active_dht_limit, -1);
     settingsPack.set_int(lt::settings_pack::active_lsd_limit, -1);
-    settingsPack.set_int(lt::settings_pack::alert_queue_size, std::numeric_limits<int>::max() / 2);
+    // Sized for large seeding farms (hundreds of torrents): the libtorrent
+    // default of 5000 overflows instantly, causing tracker/dht replies to be
+    // dropped (announces failing). A bounded 50k still protects the main
+    // thread from unbounded alert backlogs.
+    settingsPack.set_int(lt::settings_pack::alert_queue_size, 50000);
 
     // Outgoing ports
     settingsPack.set_int(lt::settings_pack::outgoing_port, outgoingPortsMin());
@@ -2193,7 +2225,21 @@ lt::settings_pack SessionImpl::loadLTSettings() const
     // Include overhead in transfer limits
     settingsPack.set_bool(lt::settings_pack::rate_limit_ip_overhead, includeOverheadInLimits());
     // IP address to announce to trackers
-    settingsPack.set_str(lt::settings_pack::announce_ip, announceIP().toStdString());
+    // IP address to announce to trackers
+    // Skip the configured announce IP if it no longer exists on any interface,
+    // otherwise trackers would hand out a dead address and peers could never
+    // connect back to us (resulting in zero uploads).
+    if (const QHostAddress announceAddr {announceIP()}; !announceAddr.isNull())
+    {
+        if (QNetworkInterface::allAddresses().contains(announceAddr))
+            settingsPack.set_str(lt::settings_pack::announce_ip, announceIP().toStdString());
+        else
+            LogMsg(tr("Configured announce IP is no longer present and will be ignored. IP: \"%1\"").arg(announceIP()), Log::WARNING);
+    }
+    else
+    {
+        settingsPack.set_str(lt::settings_pack::announce_ip, announceIP().toStdString());
+    }
 #if LIBTORRENT_VERSION_NUM >= 20011
     // Port to announce to trackers
     settingsPack.set_int(lt::settings_pack::announce_port, announcePort());
@@ -2311,6 +2357,86 @@ void SessionImpl::applyNetworkInterfacesSettings(lt::settings_pack &settingsPack
     if (isSSLEnabled())
         portStrings.append(u':' + QString::number(sslPort()) + u's');
 
+#ifdef Q_OS_WIN
+    // Collect stable (non-temporary) global IPv6 addresses of all interfaces.
+    // Windows prefers RFC4941 temporary addresses as the source for outbound
+    // connections, so a wildcard-bound client announces to trackers/DHT with an
+    // address that most peers cannot connect back to (resulting in zero
+    // uploads). Pinning outgoing sockets to the stable addresses avoids that
+    // while keeping the wildcard (all-addresses) listening intact.
+    // See upstream issues #16815, #16783, #24096.
+    QStringList stableV6Addresses;
+    int excludedTemporaryV6 = 0;
+    int excludedNonPreferredV6 = 0;
+    ULONG adaptersSize = 0;
+    const ULONG gaResult = ::GetAdaptersAddresses(AF_INET6, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr, nullptr, &adaptersSize);
+    if (gaResult == ERROR_BUFFER_OVERFLOW)
+    {
+        std::vector<BYTE> adaptersBuf(adaptersSize);
+        auto *adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(adaptersBuf.data());
+        if (::GetAdaptersAddresses(AF_INET6, GAA_FLAG_INCLUDE_ALL_INTERFACES, nullptr, adapters, &adaptersSize)
+                == NO_ERROR)
+        {
+            for (auto *adapter = adapters; adapter; adapter = adapter->Next)
+            {
+                if (adapter->OperStatus != IfOperStatusUp)
+                    continue;
+                for (auto *unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next)
+                {
+                    if (unicast->Address.lpSockaddr->sa_family != AF_INET6)
+                        continue;
+
+                    const QString addrStr = Utils::Net::canonicalIPv6Addr(QHostAddress(unicast->Address.lpSockaddr)).toString();
+
+                    // Skip deprecated and temporary (privacy) addresses so that
+                    // outbound connections always use a stable, publicly
+                    // reachable source address.
+                    // IP_ADAPTER_ADDRESS_TRANSIENT marks RFC4941 temporary
+                    // addresses; DNS_ELIGIBLE additionally excludes the random
+                    // permanent ones.
+                    if (unicast->DadState != IpDadStatePreferred)
+                    {
+                        ++excludedNonPreferredV6;
+                        qDebug("[listen-config] excluding non-preferred IPv6 address: %s (DadState=%d)"
+                               , qUtf8Printable(addrStr), static_cast<int>(unicast->DadState));
+                        continue;
+                    }
+                    if ((unicast->Flags & (IP_ADAPTER_ADDRESS_TRANSIENT | IP_ADAPTER_ADDRESS_DNS_ELIGIBLE))
+                            != IP_ADAPTER_ADDRESS_DNS_ELIGIBLE)
+                    {
+                        ++excludedTemporaryV6;
+                        qDebug("[listen-config] excluding temporary/random IPv6 address: %s (Flags=0x%x)"
+                               , qUtf8Printable(addrStr), unicast->Flags);
+                        continue;
+                    }
+
+                    stableV6Addresses.append(addrStr);
+                }
+            }
+        }
+        else
+        {
+            LogMsg(tr("Failed to query IPv6 adapters for stable addresses. Error: %1").arg(::GetLastError()), Log::WARNING);
+        }
+    }
+    else if (gaResult != NO_ERROR)
+    {
+        LogMsg(tr("Failed to query IPv6 adapters for stable addresses. Error: %1").arg(gaResult), Log::WARNING);
+    }
+#else
+    // The same problem exists on systems with RFC4941 privacy extensions; without
+    // a portable way to query the address lifecycle, list all global v6 addresses.
+    const int excludedTemporaryV6 = 0;
+    const int excludedNonPreferredV6 = 0;
+    QStringList stableV6Addresses;
+    for (const QHostAddress &address : asConst(QNetworkInterface::allAddresses()))
+    {
+        if ((address.protocol() == QAbstractSocket::IPv6Protocol)
+                && address.isGlobal())
+            stableV6Addresses.append(Utils::Net::canonicalIPv6Addr(address).toString());
+    }
+#endif
+
     for (const QString &ip : asConst(getListeningIPs()))
     {
         const QHostAddress addr {ip};
@@ -2324,8 +2450,19 @@ void SessionImpl::applyNetworkInterfacesSettings(lt::settings_pack &settingsPack
             for (const QString &portString : asConst(portStrings))
                 endpoints << ((isIPv6 ? (u'[' + ip + u']') : ip) + portString);
 
-            if ((ip != u"0.0.0.0") && (ip != u"::"))
+            // Outgoing sockets: pin stable IPv6 addresses only (never temporary
+            // ones); wildcards cover the rest of the source selection.
+            if (isIPv6)
+            {
+                if ((ip != u"::") && stableV6Addresses.contains(ip))
+                    outgoingInterfaces << ip;
+                else if ((ip == u"::") && !stableV6Addresses.isEmpty())
+                    outgoingInterfaces << stableV6Addresses;
+            }
+            else
+            {
                 outgoingInterfaces << ip;
+            }
         }
         else
         {
@@ -2361,6 +2498,15 @@ void SessionImpl::applyNetworkInterfacesSettings(lt::settings_pack &settingsPack
     const QString finalEndpoints = endpoints.join(u',');
     settingsPack.set_str(lt::settings_pack::listen_interfaces, finalEndpoints.toStdString());
     LogMsg(tr("Trying to listen on the following list of IP addresses: \"%1\"").arg(finalEndpoints));
+
+    // Diagnostic summary: what we listen on vs what we announce/connect from.
+    // If uploads stall, compare "outgoing" here against what trackers/DHT see.
+    LogMsg(tr("Listening endpoints: %1. Outgoing interfaces: %2. Stable IPv6 (outbound-capable): %3. Excluded temporary IPv6: %4, non-preferred IPv6: %5")
+        .arg(finalEndpoints,
+             outgoingInterfaces.join(u','),
+             stableV6Addresses.join(u','),
+             QString::number(excludedTemporaryV6),
+             QString::number(excludedNonPreferredV6)), Log::INFO);
 
     settingsPack.set_str(lt::settings_pack::outgoing_interfaces, outgoingInterfaces.join(u',').toStdString());
     m_listenInterfaceConfigured = true;
@@ -3568,12 +3714,26 @@ QStringList SessionImpl::getListeningIPs() const
             checkAndAddIP(addr, configuredAddr);
 
         // At this point ifaceAddr was non-empty
-        // If IPs.isEmpty() it means the configured Address was not found
+        // If IPs.isEmpty() it means the configured Address was not found (e.g. a
+        // expired temporary/leased IPv6 address). Binding to a stale address would
+        // make the whole session unreachable (no incoming connections, dead DHT),
+        // so fall back to all addresses instead of passing the dead address on.
         if (IPs.isEmpty())
         {
-            LogMsg(tr("Failed to find the configured network address to listen on. Address: \"%1\"")
-                .arg(ifaceAddr), Log::CRITICAL);
-            IPs.append(ifaceAddr);
+            LogMsg(tr("Configured network address is no longer present on any interface. "
+                      "Falling back to all addresses. Address: \"%1\"")
+                .arg(ifaceAddr), Log::WARNING);
+            IPs.append(u"0.0.0.0"_s);
+            IPs.append(u"::"_s);
+        }
+        else if ((configuredAddr.protocol() == QAbstractSocket::IPv6Protocol)
+                 || (configuredAddr.protocol() == QAbstractSocket::IPv4Protocol))
+        {
+            // Add a wildcard bind for the other address family so both stacks
+            // stay usable. A v6-only session can't announce to IPv4 trackers
+            // ("unreachable") and a v4-only session can't reach IPv6 swarms.
+            IPs.append((configuredAddr.protocol() == QAbstractSocket::IPv6Protocol)
+                       ? u"0.0.0.0"_s : u"::"_s);
         }
 
         return IPs;
@@ -3603,11 +3763,15 @@ QStringList SessionImpl::getListeningIPs() const
     // Make sure there is at least one IP
     // At this point there was an explicit interface and an explicit address set
     // and the address should have been found
+    // If the configured address disappeared (e.g. expired temporary/leased IPv6
+    // address), fall back to all addresses of this interface instead of passing
+    // the stale address on, which would make the session unreachable.
     if (IPs.isEmpty())
     {
-        LogMsg(tr("Failed to find the configured network address to listen on. Address: \"%1\"")
-            .arg(ifaceAddr), Log::CRITICAL);
-        IPs.append(ifaceAddr);
+        LogMsg(tr("Configured network address is no longer present on the interface. "
+                  "Falling back to all addresses of the interface. Interface: \"%1\". Address: \"%2\"")
+            .arg(ifaceName, ifaceAddr), Log::WARNING);
+        IPs.append(ifaceName);
     }
 
     return IPs;
@@ -3615,10 +3779,98 @@ QStringList SessionImpl::getListeningIPs() const
 
 // Set the ports range in which is chosen the port
 // the BitTorrent session will listen to
+// Persist the DHT routing table (nodes + node IDs) so the next session start
+// can rejoin the DHT swarm instantly, instead of slowly bootstrapping again
+// from a handful of routers.
+void SessionImpl::saveDHTState() const
+{
+    try
+    {
+        const std::vector<char> data = lt::write_session_params_buf(
+                    m_nativeSession->session_state(lt::session::save_dht_state));
+
+        const Path dhtStatePath = specialFolderLocation(SpecialFolder::Data) / Path(u"dht_state.dat"_s);
+        QFile file {dhtStatePath.data()};
+        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
+            file.write(data.data(), static_cast<qint64>(data.size()));
+            file.close();
+        }
+        else
+        {
+            LogMsg(tr("Failed to save DHT state. File: \"%1\"").arg(dhtStatePath.toString()), Log::WARNING);
+        }
+    }
+    catch (const std::exception &exc)
+    {
+        LogMsg(tr("Failed to save DHT state. Reason: \"%1\"").arg(QString::fromLocal8Bit(exc.what())), Log::WARNING);
+    }
+}
+
+// Load the DHT state saved at last shutdown into the session parameters used
+// to construct the native session.
+void SessionImpl::loadDHTState(lt::session_params &sessionParams) const
+{
+    const Path dhtStatePath = specialFolderLocation(SpecialFolder::Data) / Path(u"dht_state.dat"_s);
+    QFile file {dhtStatePath.data()};
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+
+    const QByteArray data = file.readAll();
+    file.close();
+    if (data.isEmpty())
+        return;
+
+    try
+    {
+        const lt::session_params savedParams = lt::read_session_params(
+                    lt::span<const char>(data.constData(), data.size()), lt::session::save_dht_state);
+        sessionParams.dht_state = savedParams.dht_state;
+    }
+    catch (const std::exception &exc)
+    {
+        LogMsg(tr("Failed to load DHT state. Reason: \"%1\"").arg(QString::fromLocal8Bit(exc.what())), Log::WARNING);
+    }
+}
+
 void SessionImpl::configureListeningInterface()
 {
     m_listenInterfaceConfigured = false;
     configureDeferred();
+}
+
+// Detect configured listening addresses that have disappeared from the system
+// (typically expired temporary/leased IPv6 addresses) and re-apply the listening
+// configuration, so the session won't stay bound to a stale, unreachable address.
+void SessionImpl::checkListenInterfaceAddresses()
+{
+    if (!m_listenInterfaceConfigured || !m_isRestored)
+        return;
+
+    // Only relevant when the user pinned specific addresses to listen on.
+    const QStringList configuredIPs = getListeningIPs();
+    bool hasPinnedAddress = false;
+    bool allPresent = true;
+    for (const QString &ip : configuredIPs)
+    {
+        const QHostAddress addr {ip};
+        // Skip wildcard binds ("all addresses") and interface names: they can
+        // never "disappear", and treating them as pinned addresses would cause
+        // a pointless re-configure loop (which resets libtorrent's listening
+        // sockets and the DHT every pass).
+        if (addr.isNull() || (ip == u"0.0.0.0") || (ip == u"::"))
+            continue;
+
+        hasPinnedAddress = true;
+        if (!QNetworkInterface::allAddresses().contains(addr))
+            allPresent = false;
+    }
+
+    if (hasPinnedAddress && !allPresent)
+    {
+        LogMsg(tr("Configured listening address is no longer present. Re-applying the listening interface configuration..."), Log::WARNING);
+        configureListeningInterface();
+    }
 }
 
 int SessionImpl::globalDownloadSpeedLimit() const
@@ -6086,6 +6338,15 @@ void SessionImpl::setTorrentContentLayout(const TorrentContentLayout value)
 // Read alerts sent by libtorrent session
 void SessionImpl::readAlerts()
 {
+    // Cap the per-invocation workload: with hundreds of seeding torrents a
+    // single pop_alerts() can return tens of thousands of alerts, and
+    // processing them all synchronously freezes the GUI thread until the
+    // whole batch is done (alert queue then overflows because we can't keep
+    // up, which makes things worse on the next round). Process a bounded
+    // slice per event-loop pass instead; the remaining alerts are handled on
+    // the next scheduled read.
+    constexpr int MAX_ALERTS_PER_BATCH = 2000;
+
     fetchPendingAlerts();
 
     Q_ASSERT(m_loadedTorrents.isEmpty());
@@ -6093,10 +6354,14 @@ void SessionImpl::readAlerts()
     if (!isRestored())
         m_loadedTorrents.reserve(MAX_PROCESSING_RESUMEDATA_COUNT);
 
+    const qsizetype totalAlerts = m_alerts.size();
+    const qsizetype batchEnd = std::min<qsizetype>(totalAlerts, MAX_ALERTS_PER_BATCH);
+
     int previousAlertType = -1;
     qsizetype alertSequenceSize = 0;
-    for (lt::alert *a : m_alerts)
+    for (qsizetype i = 0; i < batchEnd; ++i)
     {
+        lt::alert *a = m_alerts[i];
         const int alertType = a->type();
         if ((alertType != previousAlertType) && (previousAlertType != -1))
         {
@@ -6108,10 +6373,19 @@ void SessionImpl::readAlerts()
         ++alertSequenceSize;
         previousAlertType = alertType;
     }
-    endAlertSequence(previousAlertType, alertSequenceSize);
+
+    if (batchEnd > 0)
+        endAlertSequence(previousAlertType, alertSequenceSize);
 
     // Some torrents may become "finished" after different alerts handling.
     processPendingFinishedTorrents();
+
+    if (batchEnd < totalAlerts)
+    {
+        // Drop the processed slice and keep the rest for the next pass.
+        m_alerts.erase(m_alerts.begin(), m_alerts.begin() + batchEnd);
+        QMetaObject::invokeMethod(this, &SessionImpl::readAlerts, Qt::QueuedConnection);
+    }
 }
 
 void SessionImpl::handleAddTorrentAlert(const lt::add_torrent_alert *alert)
@@ -6386,6 +6660,26 @@ void SessionImpl::handleFileErrorAlert(const lt::file_error_alert *alert)
 
     torrent->handleFileError({.error = alert->error, .operation = alert->op});
 
+    // Auto-recover from transient file errors: libtorrent puts the torrent
+    // into an error state and waits for manual intervention. For errors that
+    // are likely self-healing (file replaced/moved back, network share back),
+    // schedule a single recheck so seeding resumes without user action.
+    // Rate-limited via m_recentErroredTorrents to avoid hammering a failing
+    // disk with endless rechecks.
+    if ((alert->error.value() == boost::system::errc::no_such_file_or_directory)
+            && (alert->op == lt::operation_t::file_read))
+    {
+        const TorrentID errorId = torrent->id();
+        if (!m_recentErroredTorrents.contains(errorId))
+        {
+            // Resume (not recheck!): keep the verified have-bitfield intact and
+            // let libtorrent reconnect to peers -- only the missing boundary
+            // pieces will be downloaded from them, no full disk re-read.
+            LogMsg(tr("Auto-resuming torrent after file error. Torrent: \"%1\"").arg(torrent->name()), Log::INFO);
+            torrent->start(TorrentOperatingMode::Forced);
+        }
+    }
+
     const TorrentID id = torrent->id();
     if (!m_recentErroredTorrents.contains(id))
     {
@@ -6403,11 +6697,24 @@ void SessionImpl::handleFileErrorAlert(const lt::file_error_alert *alert)
 
 void SessionImpl::handlePortmapWarningAlert(const lt::portmap_error_alert *alert)
 {
+    // NAT-PMP/PCP is an IPv4 NAT protocol: requesting a mapping for an IPv6
+    // address always fails ("no resources") on any router, since IPv6 needs no
+    // NAT. Downgrade that expected failure to debug so it doesn't spam the log
+    // on every listen-address/refresh cycle. Real failures (IPv4 rejected,
+    // router offline) still log as warnings.
+    const bool isIPv6MappingFailure = alert->local_address.is_v6()
+        && (alert->map_transport == lt::portmap_transport::natpmp);
 #ifdef QBT_USES_LIBTORRENT2
+    if (isIPv6MappingFailure)
+    {
+        qDebug() << "Port forwarding unavailable for IPv6 address (expected):" << toString(alert->local_address);
+        return;
+    }
     LogMsg(tr("Port forwarding failed. Protocol: %1. Local address: \"%2\". Message: \"%3\"")
         .arg(toString(alert->map_transport), toString(alert->local_address), QString::fromStdString(alert->message()))
         , Log::WARNING);
 #else
+    Q_UNUSED(isIPv6MappingFailure);
     LogMsg(tr("Port forwarding failed. Protocol: %1. Message: \"%2\"")
         .arg(toString(alert->map_transport), QString::fromStdString(alert->message()))
         , Log::WARNING);
@@ -6534,12 +6841,22 @@ void SessionImpl::handleExternalIPAlert(const lt::external_ip_alert *alert)
         if (isReannounceWhenAddressChangedEnabled() && !m_lastExternalIPv6Address.isEmpty())
             reannounceToAllTrackers();
         m_lastExternalIPv6Address = externalIP;
+
+        // The external IPv6 address just changed: the previously bound listening
+        // address (if pinned) may be stale, and the DHT may be running on dead
+        // sockets. Re-evaluate the listening configuration immediately instead
+        // of waiting for the next periodic check.
+        if (m_isRestored)
+            checkListenInterfaceAddresses();
     }
     else if (isIPv4 && (externalIP != m_lastExternalIPv4Address))
     {
         if (isReannounceWhenAddressChangedEnabled() && !m_lastExternalIPv4Address.isEmpty())
             reannounceToAllTrackers();
         m_lastExternalIPv4Address = externalIP;
+
+        if (m_isRestored)
+            checkListenInterfaceAddresses();
     }
 }
 

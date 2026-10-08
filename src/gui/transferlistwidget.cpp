@@ -667,6 +667,24 @@ void TransferListWidget::recheckSelectedTorrents()
         torrent->forceRecheck();
 }
 
+void TransferListWidget::forceSeedModeSelectedTorrents()
+{
+    if (Preferences::instance()->confirmTorrentRecheck())
+    {
+        const QMessageBox::StandardButton ret = QMessageBox::question(this
+                , tr("Force seed mode confirmation")
+                , tr("Are you sure you want to force the selected torrent(s) into seed mode? "
+                   "They will be treated as fully downloaded without verification. "
+                   "Only use this if the missing pieces belong to files you excluded, "
+                   "or if you are cross-seeding known-complete data.")
+                , QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (ret != QMessageBox::Yes) return;
+    }
+
+    for (BitTorrent::Torrent *const torrent : asConst(getSelectedTorrents()))
+        torrent->forceSeedMode();
+}
+
 void TransferListWidget::reannounceSelectedTorrents()
 {
     for (BitTorrent::Torrent *const torrent : asConst(getSelectedTorrents()))
@@ -1025,6 +1043,8 @@ void TransferListWidget::displayListMenu()
     connect(actionSetTorrentPath, &QAction::triggered, this, &TransferListWidget::setSelectedTorrentsLocation);
     auto *actionForceRecheck = new QAction(UIThemeManager::instance()->getIcon(u"force-recheck"_s, u"document-edit-verify"_s), tr("Force rec&heck"), listMenu);
     connect(actionForceRecheck, &QAction::triggered, this, &TransferListWidget::recheckSelectedTorrents);
+    auto *actionForceSeedMode = new QAction(UIThemeManager::instance()->getIcon(u"force-recheck"_s, u"document-edit-verify"_s), tr("Force &seed mode (skip recheck)"), listMenu);
+    connect(actionForceSeedMode, &QAction::triggered, this, &TransferListWidget::forceSeedModeSelectedTorrents);
     auto *actionForceReannounce = new QAction(UIThemeManager::instance()->getIcon(u"reannounce"_s, u"document-edit-verify"_s), tr("Force r&eannounce"), listMenu);
     connect(actionForceReannounce, &QAction::triggered, this, &TransferListWidget::reannounceSelectedTorrents);
     auto *actionCopyMagnetLink = new QAction(UIThemeManager::instance()->getIcon(u"torrent-magnet"_s, u"kt-magnet"_s), tr("&Magnet link"), listMenu);
@@ -1300,6 +1320,7 @@ void TransferListWidget::displayListMenu()
         listMenu->addSeparator();
     if (oneHasMetadata)
         listMenu->addAction(actionForceRecheck);
+        listMenu->addAction(actionForceSeedMode);
     // We can not force reannounce torrents that are stopped/errored/checking/missing files/queued.
     // We may already have the tracker list from magnet url. So we can force reannounce torrents without metadata anyway.
     listMenu->addAction(actionForceReannounce);

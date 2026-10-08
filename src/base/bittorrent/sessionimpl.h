@@ -582,6 +582,11 @@ namespace BitTorrent
         void processBannedIPs(lt::ip_filter &filter);
         QStringList getListeningIPs() const;
         void configureListeningInterface();
+        void checkListenInterfaceAddresses();
+#ifdef QBT_USES_LIBTORRENT2
+        void saveDHTState() const;
+        void loadDHTState(lt::session_params &sessionParams) const;
+#endif
         void enableTracker(bool enable);
         void enableBandwidthScheduler();
         void populateAdditionalTrackers();

@@ -1708,6 +1708,45 @@ void TorrentImpl::forceDHTAnnounce()
     m_nativeHandle.force_dht_announce();
 }
 
+void TorrentImpl::forceSeedMode()
+{
+    if (!hasMetadata())
+        return;
+
+    // libtorrent 2.0 refuses to enter seed_mode for torrents whose
+    // file_priorities contain "dont_download" entries (and seed_mode cannot be
+    // entered at runtime via set_flags at all). The workable alternative:
+    // mark every *missing* piece as priority=Ignored. libtorrent's
+    // is_finished() compares total_wanted_done against total_wanted, and
+    // ignored pieces are excluded from total_wanted -- so the torrent
+    // immediately becomes finished/seeding and keeps serving the pieces it
+    // has. The excluded pieces are never downloaded.
+    std::vector<lt::download_priority_t> piecePriorities =
+            m_nativeHandle.get_piece_priorities();
+
+    int ignoredCount = 0;
+    for (int idx = 0; idx < static_cast<int>(piecePriorities.size()); ++idx)
+    {
+        const lt::piece_index_t i {idx};
+        if (!m_nativeHandle.have_piece(i)
+            && (piecePriorities[idx] != LT::toNative(DownloadPriority::Ignored)))
+        {
+            piecePriorities[idx] = LT::toNative(DownloadPriority::Ignored);
+            ++ignoredCount;
+        }
+    }
+
+    if (ignoredCount > 0)
+        m_nativeHandle.prioritize_pieces(piecePriorities);
+
+    LogMsg(tr("Force seed mode: %1 missing pieces excluded from download. Torrent: \"%2\"")
+        .arg(ignoredCount).arg(name()), Log::INFO);
+
+    // Make sure the torrent is running so it can serve peers.
+    if (hasError() || isStopped())
+        start(TorrentOperatingMode::Forced);
+}
+
 void TorrentImpl::forceRecheck()
 {
     if (!hasMetadata())
